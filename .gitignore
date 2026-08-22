@@ -1,0 +1,7 @@
+# Never commit a filled-in configuration file: every password in it is real.
+.env
+.env.local
+*.env.backup
+
+# Locally generated TLS material. Never commit a private key.
+certs/
