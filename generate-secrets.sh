@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #
-# Fills the four password fields in ./.env with fresh random values.
+# Fills the password/secret fields in ./.env with fresh random values: the four
+# core Jitsi ones, plus the three live-transcription ones (jigasi is behind a
+# compose profile and off unless explicitly started — see README §"Live
+# transcription" — but its secrets are still generated here so `docker compose
+# --profile transcription up -d` has something valid to read).
 #
 # WHY A SCRIPT: the upstream docker-jitsi-meet `gen-passwords.sh` generates
-# passwords for services this deployment does not run (jibri, jigasi), and does
-# not know about JWT_APP_SECRET, which is the one that actually gates access to
-# Ameen board meetings. This generates exactly the four this stack needs.
+# passwords for jibri (a service this deployment does not run at all) and does
+# not know about JWT_APP_SECRET or the transcription secrets, which are Ameen's
+# own. This generates exactly what this stack needs.
 #
 # SAFETY: refuses to overwrite a value that is already set, so re-running it
 # after adding one service cannot silently rotate the others and lock the running
@@ -61,15 +65,18 @@ set_value() {
 }
 
 echo "Generating secrets in $(pwd)/.env"
-set_value JWT_APP_SECRET        "$(random_hex 32)"
-set_value JICOFO_AUTH_PASSWORD  "$(random_hex 24)"
-set_value JVB_AUTH_PASSWORD     "$(random_hex 24)"
+set_value JWT_APP_SECRET             "$(random_hex 32)"
+set_value JICOFO_AUTH_PASSWORD       "$(random_hex 24)"
+set_value JVB_AUTH_PASSWORD          "$(random_hex 24)"
+set_value JIGASI_XMPP_PASSWORD       "$(random_hex 24)"
+set_value JIGASI_TRANSCRIBER_PASSWORD "$(random_hex 24)"
+set_value TRANSCRIPTION_INGEST_SECRET "$(random_hex 32)"
 
 chmod 600 .env
 
 cat <<'NOTE'
 
-Done. Two follow-up steps, both required:
+Done. Follow-up steps:
 
   1. Copy JWT_APP_SECRET and JWT_APP_ID into the Ameen backend's .env as
      JITSI_JWT_APP_SECRET and JITSI_JWT_APP_ID. They must match exactly, or
@@ -85,5 +92,16 @@ Done. Two follow-up steps, both required:
      Rotating JICOFO_AUTH_PASSWORD or JVB_AUTH_PASSWORD without clearing that
      volume leaves jicofo and jvb unable to authenticate, which presents as
      conferences that never connect.
+
+  3. Only if you intend to turn on live transcription (see README §"Live
+     transcription" first — it changes a privacy guarantee this stack
+     otherwise makes): copy the just-generated TRANSCRIPTION_INGEST_SECRET
+     into the Ameen backend's .env too (same key name, same value), then set
+     TRANSCRIPTION_WEBSOCKET_URL here using the token this secret derives —
+     print it with:
+
+       node -e "console.log(require('crypto').createHmac('sha256', process.env.TRANSCRIPTION_INGEST_SECRET).update('live-transcription-ingest').digest('hex'))"
+
+     run from a shell that has TRANSCRIPTION_INGEST_SECRET exported.
 
 NOTE

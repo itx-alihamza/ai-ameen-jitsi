@@ -16,12 +16,17 @@
 #   - jibri     — recording and live streaming. Out of scope: Ameen stores no
 #                 audio or video. Adding this service is what would make
 #                 recording possible, so it is not here.
-#   - jigasi    — SIP gateway and transcription bridge. Transcription is deferred
-#                 to a later phase; no speech-to-text provider is installed.
 #   - etherpad  — collaborative notes. Minutes live in Ameen, under its RBAC and
 #                 approval workflow, not in an unauthenticated pad.
 #   - a volume for media of any kind. The volumes below hold configuration and
 #                 Prosody's certificates/authentication state only.
+#
+# `jigasi` (live-transcription bridge) IS present below, but behind
+# `profiles: ['transcription']` — `docker compose up -d` does NOT start it, and
+# `ENABLE_TRANSCRIPTIONS` defaults to `0` on web/prosody/jicofo. A transcriber
+# participant has room audio access once this is turned on — see the `jigasi`
+# service comment and README §"Live transcription" for what that changes and
+# what stays true regardless (no recording, no media written to disk).
 #
 # UPGRADES: pin `JITSI_IMAGE_TAG` to a stable release and move it deliberately.
 # All customization is via environment variables and Ameen-side
@@ -97,13 +102,17 @@ services:
       - JWT_ACCEPTED_ISSUERS=${JWT_APP_ID}
       - JWT_ACCEPTED_AUDIENCES=${JWT_APP_ID}
       - JWT_ENABLE_DOMAIN_VERIFICATION=false
-      # Recording and transcription: off, and off again. The Ameen join token
-      # also denies both features per user, so three independent settings would
-      # have to change before any capture were possible.
+      # Recording: off, and off again — never a toggle, no env var moves it.
+      # Transcription: off by default, an explicit opt-in (`ENABLE_TRANSCRIPTIONS=1`
+      # in `.env`, alongside starting the `jigasi` service with
+      # `--profile transcription`) for deployments that want the live-transcription
+      # bridge. The Ameen join token independently gates both per user: recording
+      # stays denied unconditionally; transcription only for a moderator when this
+      # deployment has the bridge configured. See README §"Live transcription".
       - ENABLE_RECORDING=0
       - ENABLE_FILE_RECORDING_SERVICE=0
       - ENABLE_LIVESTREAMING=0
-      - ENABLE_TRANSCRIPTIONS=0
+      - ENABLE_TRANSCRIPTIONS=${ENABLE_TRANSCRIPTIONS:-0}
       - ENABLE_SERVICE_RECORDING=0
       # Browser-side "local recording": a participant recording their own audio and
       # downloading it. It writes nothing to the server, but it is still recording,
@@ -171,7 +180,7 @@ services:
       - ENABLE_GUESTS=${ENABLE_GUESTS:-0}
       - ENABLE_LOBBY=1
       - ENABLE_RECORDING=0
-      - ENABLE_TRANSCRIPTIONS=0
+      - ENABLE_TRANSCRIPTIONS=${ENABLE_TRANSCRIPTIONS:-0}
       - GLOBAL_MODULES=${GLOBAL_MODULES:-}
       - JWT_APP_ID=${JWT_APP_ID}
       - JWT_APP_SECRET=${JWT_APP_SECRET}
@@ -199,6 +208,16 @@ services:
       - JICOFO_AUTH_PASSWORD=${JICOFO_AUTH_PASSWORD}
       - JVB_AUTH_USER=${JVB_AUTH_USER:-jvb}
       - JVB_AUTH_PASSWORD=${JVB_AUTH_PASSWORD}
+      # Prosody is what actually PROVISIONS these two accounts (it registers them
+      # on boot the same way it does JICOFO_AUTH_USER/JVB_AUTH_USER above) — the
+      # `jigasi` service's own environment just tells jigasi which credentials to
+      # log in WITH. Without these two lines here, jigasi's login is refused with
+      # SASL `not-authorized`, since no such account was ever created. Harmless
+      # to set even when `jigasi` is never started (the `transcription` profile is
+      # off by default) — an unused registered account is not a live credential
+      # path.
+      - JIGASI_XMPP_USER=${JIGASI_XMPP_USER:-jigasi}
+      - JIGASI_XMPP_PASSWORD=${JIGASI_XMPP_PASSWORD}
     networks:
       jitsi:
         aliases:
@@ -221,7 +240,7 @@ services:
       - AUTH_TYPE=${AUTH_TYPE:-jwt}
       - ENABLE_AUTH=${ENABLE_AUTH:-1}
       - ENABLE_RECORDING=0
-      - ENABLE_TRANSCRIPTIONS=0
+      - ENABLE_TRANSCRIPTIONS=${ENABLE_TRANSCRIPTIONS:-0}
       - JICOFO_AUTH_USER=${JICOFO_AUTH_USER:-focus}
       - JICOFO_AUTH_PASSWORD=${JICOFO_AUTH_PASSWORD}
       - JICOFO_ENABLE_HEALTH_CHECKS=1
@@ -317,6 +336,19 @@ services:
       # mounted on purpose — see above.
       - jitsi-jigasi-config:/config:Z
     environment:
+      # THE SWITCH THAT ACTUALLY MATTERS. The image's own init script
+      # (`/etc/cont-init.d/10-config`) defaults `JIGASI_MODE` to `sip` when
+      # this is unset, and ONLY appends
+      # `/defaults/transcriber-sip-communicator.properties` — the file every
+      # `JIGASI_TRANSCRIBER_*` var below feeds — when `JIGASI_MODE=transcriber`
+      # exactly. Without this line every `JIGASI_TRANSCRIBER_*` var is silently
+      # ignored: jigasi still joins the brewery and looks fully healthy in its
+      # own logs, but never announces `transcriber` capability, so Jicofo's
+      # `/stats` (`jigasi_detector.transcriber_count`) stays `0` and every
+      # transcription request fails "no instances available" with no error
+      # anywhere pointing at this. Confirmed by reading
+      # `/etc/cont-init.d/10-config` inside a running container, not assumed.
+      - JIGASI_MODE=transcriber
       - ENABLE_AUTH=${ENABLE_AUTH:-1}
       - XMPP_AUTH_DOMAIN=${XMPP_AUTH_DOMAIN:-auth.meet.jitsi}
       - XMPP_DOMAIN=${XMPP_DOMAIN:-meet.jitsi}
@@ -342,14 +374,46 @@ services:
       # in transcription-ingest.server.ts. Confirmed by reading the class out of
       # this exact image tag rather than from documentation.
       - JIGASI_TRANSCRIBER_CUSTOM_SERVICE=org.jitsi.jigasi.transcription.VoskTranscriptionService
-      # Points at the Ameen backend. `${MEETING_ID}` is NOT substituted by Jigasi
-      # — see README §Live transcription for the per-room limitation this leaves.
-      - JIGASI_TRANSCRIBER_VOSK_WEBSOCKET_URL=${TRANSCRIPTION_WEBSOCKET_URL}
+      # A single STATIC url — confirmed by reading `VoskTranscriptionService` and
+      # `remoteTranscriptionConfigUrl`'s source that Jigasi has no way to carry a
+      # per-room/per-meeting identifier to this endpoint (the config callback only
+      # selects which transcriber *class* to use, never a custom URL). Which
+      # meeting an incoming connection belongs to is therefore NOT this URL's
+      # job — it comes from Ameen's single-active transcription lease
+      # (`integrations/speechmatics/infrastructure/transcription-lease.ts`), which
+      # is why at most one meeting can be transcribed at a time. The `token` here
+      # is a fixed value derived from `TRANSCRIPTION_INGEST_SECRET` — see README
+      # §Live transcription — never a per-meeting value.
+      #
+      # THE VARIABLE NAME MATTERS: the image's config template
+      # (`/defaults/transcriber-sip-communicator.properties` inside the
+      # container) reads `JIGASI_TRANSCRIBER_VOSK_URL`, NOT
+      # `JIGASI_TRANSCRIBER_VOSK_WEBSOCKET_URL` — confirmed by inspecting the
+      # actual rendered `/config/transcriber-sip-communicator.properties` in a
+      # running container. An earlier version of this file used the wrong
+      # name; `org.jitsi.jigasi.transcription.vosk.websocket_url` was silently
+      # never set, jigasi never announced `transcriber` capability to Jicofo
+      # (`jigasi_detector.transcriber_count` stayed `0` in
+      # `curl http://jicofo:8888/stats` even though it looked fully joined in
+      # its own logs), and every transcription request failed with "no
+      # instances available" — with no error anywhere pointing at this typo.
+      - JIGASI_TRANSCRIBER_VOSK_URL=${TRANSCRIPTION_WEBSOCKET_URL}
       # ── Recording and on-disk saving: OFF, and not overridable per env ─────
       - JIGASI_TRANSCRIBER_RECORD_AUDIO=false
       - JIGASI_TRANSCRIBER_ENABLE_SAVING=0
       - JIGASI_TRANSCRIBER_SEND_TXT=false
       - JIGASI_TRANSCRIBER_ADVERTISE_URL=false
+    # This stack has no network path to the Ameen backend otherwise — they are
+    # deliberately separate compose projects (see the file header). `host-gateway`
+    # is a no-op alias on Docker Desktop (macOS/Windows already resolve
+    # host.docker.internal) and the documented way to get the same resolution on
+    # Linux Docker Engine ≥20.10. What TRANSCRIPTION_WEBSOCKET_URL actually
+    # targets on a production single-host Ubuntu deployment — and whether the
+    # backend needs a narrowly-scoped published port for it — is a decision
+    # `deployment/compose.ubuntu.yml`'s "no ports: block" comment deliberately
+    # left unmade; see README §"Live transcription" before deploying this profile.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
     networks:
       - jitsi
     depends_on:

@@ -157,53 +157,72 @@ to be *added* for the capability to exist:
 | Absent | Would enable | Why it is out of scope |
 |---|---|---|
 | `jibri` | Recording, live streaming | Ameen stores no audio or video. No recording service, no media volume, no media bucket. |
-| `jigasi` | SIP dial-in, transcription bridge | **Planned, not yet added** — see "Live transcription" below. Adding it is the next step for transcription, and it narrows a privacy guarantee, so it is a deliberate decision rather than a default. |
 | `etherpad` | Shared notes | Minutes live in Ameen under its RBAC and approval workflow, not in an unauthenticated pad. |
 
-### Live transcription (Speechmatics) — audio path not yet built
+`jigasi` (the transcription bridge) is **implemented**, not absent — see "Live
+transcription" below. It IS off by default (`profiles: ['transcription']`,
+`ENABLE_TRANSCRIPTIONS=0`), which is why the table above still lists it as
+narrowing a privacy guarantee only once deliberately turned on.
+
+### Live transcription (Speechmatics) — implemented, opt-in, one meeting at a time
 
 The Ameen backend has a complete, tested **Speechmatics Realtime** client
-(`src/modules/integrations/speechmatics/`). Nothing feeds it audio yet, so no
-meeting is transcribed today.
-
-**Why this stack cannot transcribe as configured:**
-
-| Component | Status |
-|---|---|
-| `ENABLE_TRANSCRIPTIONS` on web / prosody / jicofo | `0` |
-| `jigasi` service | not declared, not running |
-| Jigasi↔Speechmatics adapter | does not exist |
+(`src/modules/integrations/speechmatics/`) AND the Jitsi audio bridge that
+feeds it (`transcription-ingest.server.ts`). A meeting is transcribed once an
+authorized moderator joins it, automatically — no toolbar button, no separate
+action — provided this stack's `transcription` profile is running and the
+backend has `SPEECHMATICS_API_KEY`/`TRANSCRIPTION_INGEST_SECRET` set. Off by
+default; the stack runs fine without any of this configured.
 
 **Jigasi has no Speechmatics backend.** Inspecting `jigasi.jar` in
 `jitsi/jigasi:stable-9955` shows exactly four transcription services — Google Cloud,
 Oracle, Vosk, and Whisper. So Jigasi cannot call Speechmatics directly, and the
-integration needs an adapter in between:
+integration runs through Ameen's own backend instead of a separate adapter:
 
 ```
 Jitsi
-  → jigasi                 (joins as a transcriber participant; one audio stream per participant)
-  → Vosk-protocol WebSocket (raw PCM in, {"eof":1} to end)
-  → Ameen adapter           ← NOT BUILT: speaks Vosk on one side, Speechmatics on the other
-  → Speechmatics Realtime   ← BUILT and tested
-  → Ameen backend           → realtime to browser, final segments to PostgreSQL
+  → jigasi                 (joins as a transcriber participant; one WS per speaking participant)
+  → Vosk-protocol WebSocket ({"config":{"sample_rate":16000}}, raw PCM, {"eof":1})
+  → transcription-ingest.server.ts   ← BUILT — speaks Vosk on one side, Speechmatics on the other
+  → Speechmatics Realtime            ← BUILT and tested
+  → Ameen backend                    → meeting_transcript_entries (text only)
 ```
 
-The seam is `org.jitsi.jigasi.transcription.vosk.websocket_url` — a configurable
-endpoint, with `EOF_MESSAGE` and `generateWebsocketUrl` confirmed present in the
-class. `jitsi/jigasi:stable-9955` publishes an `arm64` build, so it runs on Apple
-Silicon alongside the rest of this stack.
+`jitsi/jigasi:stable-9955` publishes an `arm64` build, so it runs on Apple
+Silicon alongside the rest of this stack — confirmed, not assumed, by running
+it locally.
 
-**Two things to decide before adding Jigasi:**
+**Why at most one meeting can be transcribed at a time — read from Jigasi's own
+source, not assumed:**
 
-1. **Jigasi delivers one audio stream per participant**, so speaker identity comes
-   from the actual Jitsi participant — better than voice diarization, and it makes
-   Speechmatics' `diarization: speaker` largely redundant per stream. Prefer
-   participant identity in the mapping layer.
-2. **It narrows a privacy guarantee this file currently makes.** Today the answer to
-   "can anything server-side hear the room?" is "no such service exists". A
-   transcriber participant has audio access. Recording stays disabled — no Jibri, no
-   media volume, `DISABLE_LOCAL_RECORDING=true` — but the claim changes, and the
-   wording above must change with it rather than quietly becoming untrue.
+`org.jitsi.jigasi.transcription.vosk.websocket_url` is ONE static,
+deployment-wide URL — Jigasi has no per-room templating for it. Its one
+dynamic hook, `remoteTranscriptionConfigUrl`, calls back with
+`?conferenceFullName=<room-jid>` but only lets the response choose which
+transcriber *class* to use, never a custom URL. And the Vosk handshake itself
+carries nothing else identifying — just the sample-rate config message, then
+raw PCM. So there is no way for `transcription-ingest.server.ts` to tell two
+concurrent meetings' audio apart from the wire alone. Rather than a heuristic
+that could misattribute one org's confidential audio to another's transcript,
+Ameen enforces a hard single-active lease server-side (`transcription-lease.ts`):
+an authorized moderator's join arms it for that meeting, refusing a second
+meeting outright while one is active, and the meeting ending releases it (plus
+a safety-net timeout). `TRANSCRIPTION_WEBSOCKET_URL` below is therefore a
+STATIC token, not a per-meeting one — which meeting is actually being
+transcribed comes from the lease, not the URL.
+
+**Consequence noted, not yet acted on:** Jigasi delivers one audio stream per
+participant, so speaker identity could come from the real Jitsi participant
+rather than voice diarization — the mapping layer still uses
+`diarization: speaker` and does not yet prefer participant identity.
+
+**This narrows a privacy guarantee.** Before this feature is turned on
+(`ENABLE_TRANSCRIPTIONS=1` + the `transcription` profile), the honest answer to
+"can anything server-side hear the room?" is "no such service exists". Once
+turned on, a transcriber participant has room audio access while a meeting is
+being transcribed. Recording stays disabled regardless — no Jibri, no
+media volume, `DISABLE_LOCAL_RECORDING=true`, `JIGASI_TRANSCRIBER_RECORD_AUDIO=false`
+— only TEXT is ever persisted.
 
 **Audio handling when it is built:** audio exists transiently in memory while being
 streamed. It is never written to PostgreSQL, Supabase Storage, disk, a Docker
