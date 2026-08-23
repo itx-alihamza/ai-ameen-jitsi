@@ -331,6 +331,12 @@ services:
     image: jitsi/jigasi:${JITSI_IMAGE_TAG:-stable-9955}
     profiles: ['transcription']
     restart: unless-stopped
+    # A failing `healthcheck:` alone only changes what `docker ps` reports —
+    # Docker does not restart a container for being unhealthy by itself
+    # (that's Swarm-mode-only behaviour). The `jigasi-autoheal` service below
+    # is what actually turns "unhealthy" into a real restart.
+    labels:
+      - autoheal=true
     volumes:
       # Configuration only. No transcripts directory and no audio directory are
       # mounted on purpose — see above.
@@ -419,6 +425,82 @@ services:
     depends_on:
       prosody:
         condition: service_healthy
+    healthcheck:
+      # THIS IMAGE (jitsi/jigasi:stable-9955) SHIPS NO HTTP HEALTH ENDPOINT OF
+      # ITS OWN — checked by inspecting a running container (no jetty REST/health
+      # port is templated in `/config/sip-communicator.properties`; the only
+      # jetty property present, `org.jitsi.jigasi.transcription.jetty.port`, is
+      # pinned to `-1`/off). A plain "is the process alive" check would have
+      # reported healthy through the exact incident this exists to catch: the
+      # container was up, unkilled, logging nothing wrong, while its brewery
+      # membership had gone stale and Jicofo had silently stopped routing
+      # transcription requests to it ("no instances available", with nothing in
+      # jigasi's own logs pointing at it).
+      #
+      # So this checks the fact that actually matters — whether JICOFO currently
+      # considers a transcriber available — via Jicofo's own `/stats` REST
+      # endpoint (`jigasi_detector.transcriber_count`), reachable over this
+      # same compose network. `node` is used because it's already in the image
+      # and gives real JSON parsing instead of a fragile grep against inline
+      # JSON. A `curl`-only host, or Jicofo unreachable, or `jigasi` never
+      # having registered at all, all correctly fail this the same way.
+      test:
+        - CMD
+        - node
+        - -e
+        - |
+          require('http').get('http://jicofo:8888/stats', (r) => {
+            let body = '';
+            r.on('data', (c) => (body += c));
+            r.on('end', () => {
+              try {
+                const count = JSON.parse(body).jigasi_detector?.transcriber_count ?? 0;
+                process.exit(count > 0 ? 0 : 1);
+              } catch {
+                process.exit(1);
+              }
+            });
+          }).on('error', () => process.exit(1));
+      # Generous timing: a fresh brewery join can take longer than jicofo/jvb's
+      # own checks, and this must not flap healthy/unhealthy around a normal
+      # restart.
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── Autoheal: turns "jigasi reports unhealthy" into an actual restart ─────
+  #
+  # Docker Compose's `healthcheck:` only changes what `docker inspect`/`docker
+  # ps` report — it does not restart an unhealthy container by itself (that's
+  # Swarm-mode-only). `willfarrell/autoheal` is a small, widely used sidecar
+  # that watches the Docker socket for containers going `unhealthy` and
+  # restarts exactly those, via `AUTOHEAL_CONTAINER_LABEL` — scoped here to
+  # only the `jigasi` service's `autoheal=true` label, so this never touches
+  # web/prosody/jicofo/jvb even though it can see the whole Docker socket.
+  #
+  # WHY THIS MATTERS: the incident this whole healthcheck exists for was a
+  # `jigasi` container that stayed "running", logged nothing wrong, and quietly
+  # lost the one thing that made it useful (Jicofo no longer considered it an
+  # available transcriber). Nothing would have caught that without something
+  # actively watching and restarting on the real signal.
+  #
+  # Same profile as `jigasi`: does not start unless the `transcription`
+  # profile is brought up.
+  jigasi-autoheal:
+    image: willfarrell/autoheal:latest
+    profiles: ['transcription']
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      # Jigasi's healthcheck already waits out a slow brewery rejoin
+      # (start_period/retries above); this just controls how often autoheal
+      # itself polls container health state, not the healthcheck's own timing.
+      - AUTOHEAL_INTERVAL=30
+    volumes:
+      # Read-only: autoheal only needs to observe container health and issue
+      # restarts, never to create, remove, or inspect anything beyond that.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
 networks:
   jitsi:

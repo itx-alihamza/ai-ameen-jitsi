@@ -224,10 +224,10 @@ being transcribed. Recording stays disabled regardless — no Jibri, no
 media volume, `DISABLE_LOCAL_RECORDING=true`, `JIGASI_TRANSCRIBER_RECORD_AUDIO=false`
 — only TEXT is ever persisted.
 
-**Audio handling when it is built:** audio exists transiently in memory while being
+**Audio handling:** audio exists transiently in memory while being
 streamed. It is never written to PostgreSQL, Supabase Storage, disk, a Docker
 volume, a temporary file, or a log. It does transit Speechmatics' service, which
-processes it under that account's terms — a new processor in the path for
+processes it under that account's terms — a processor in the path for
 confidential board audio, and likely a DPA question.
 
 **Configuration** lives in the backend `.env`, not here: `SPEECHMATICS_API_KEY`
@@ -236,6 +236,42 @@ confidential board audio, and likely a DPA question.
 user-selectable), and the diarization/partials/delay settings. Verify with
 `npm run verify:speechmatics` (opt-in, gated on `SPEECHMATICS_REAL_TEST=true`; prints
 no key).
+
+**Two things that only bite in this exact combination, found by actually
+running it, not by reading the docs:**
+
+1. **`JIGASI_MODE=transcriber` is required** and is set directly in
+   `docker-compose.yml` (not a `.env` knob). Its image defaults to
+   `JIGASI_MODE=sip` when unset, which silently ignores every
+   `JIGASI_TRANSCRIBER_*` variable below it — jigasi still joins the brewery
+   and looks completely healthy in its own logs, but never announces
+   `transcriber` capability, and Jicofo fails every transcription request with
+   "no instances available" pointing at nothing. Confirmed by reading
+   `/etc/cont-init.d/10-config` inside a running container.
+2. **The env var is `JIGASI_TRANSCRIBER_VOSK_URL`**, not
+   `JIGASI_TRANSCRIBER_VOSK_WEBSOCKET_URL` (an earlier version of this file
+   used the wrong name) — confirmed by reading the actual rendered
+   `/config/sip-communicator.properties` in a running container, which only
+   sets `org.jitsi.jigasi.transcription.vosk.websocket_url` from the former.
+
+If `docker exec <jigasi> curl -s http://jicofo:8888/stats` ever shows
+`"jigasi_detector":{"transcriber_count":0,...}` while the `transcription`
+profile is up, one of these two is the first thing to check — not a Speechmatics
+or Ameen backend problem.
+
+**Reliability: `jigasi` ships no HTTP health endpoint** in this image tag
+(checked — no jetty REST/health port is configured; the only jetty property
+present is pinned off). Worse, its own XMPP reconnect logic did not
+reliably notice a dropped connection in practice: in local testing it stayed
+"running", logged nothing, and sat silently de-registered from Jicofo's
+brewery for hours. `docker-compose.yml` therefore gives it a `healthcheck`
+that polls the fact that actually matters — Jicofo's own
+`jigasi_detector.transcriber_count` — and a small `jigasi-autoheal` sidecar
+(`willfarrell/autoheal`, scoped to only the `jigasi` container via its
+`autoheal=true` label) that restarts it when that check fails. Verified
+locally: killing `jicofo` flipped `jigasi`'s health to `unhealthy` within the
+configured `retries`/`interval`, and `jigasi-autoheal` restarted it
+automatically the next poll.
 
 Recording is denied in three independent places, so no single change re-enables it:
 
