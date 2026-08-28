@@ -150,8 +150,15 @@ appearing on screen:
     ./setup-local.sh --print-backend-env >> ../ai-ameen-migrated-backend/.env
 
 Then:
-    docker compose up -d          # start Jitsi
-    docker compose ps             # wait for all four to be healthy
+    ./up.sh                       # start Jitsi (adds --profile transcription
+                                  # automatically when ENABLE_TRANSCRIPTIONS=1)
+    ./verify-transcription.sh     # confirm Jicofo actually sees a transcriber
+
+USE ./up.sh, NOT a bare \`docker compose up -d\`. The transcription bridge
+(jigasi) sits behind a compose profile, so a bare \`up\` silently leaves it
+stopped — Jicofo then reports zero transcribers and every transcription
+request fails "no instances available", with nothing in any log pointing at
+the cause. That failure has already happened once in this deployment.
 
 And ONCE per browser, visit https://localhost:${HTTPS_PORT} and accept the
 certificate warning before opening the Live Meeting tab.
