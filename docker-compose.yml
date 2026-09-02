@@ -208,16 +208,44 @@ services:
       - JICOFO_AUTH_PASSWORD=${JICOFO_AUTH_PASSWORD}
       - JVB_AUTH_USER=${JVB_AUTH_USER:-jvb}
       - JVB_AUTH_PASSWORD=${JVB_AUTH_PASSWORD}
-      # Prosody is what actually PROVISIONS these two accounts (it registers them
-      # on boot the same way it does JICOFO_AUTH_USER/JVB_AUTH_USER above) — the
+      # Prosody is what actually PROVISIONS these accounts (it registers them on
+      # boot the same way it does JICOFO_AUTH_USER/JVB_AUTH_USER above) — the
       # `jigasi` service's own environment just tells jigasi which credentials to
-      # log in WITH. Without these two lines here, jigasi's login is refused with
+      # log in WITH. Without these lines here, jigasi's login is refused with
       # SASL `not-authorized`, since no such account was ever created. Harmless
       # to set even when `jigasi` is never started (the `transcription` profile is
       # off by default) — an unused registered account is not a live credential
       # path.
+      #
+      # THERE ARE TWO SEPARATE ACCOUNTS, and needing both is not obvious:
+      #
+      #   jigasi@auth.meet.jitsi        — the CONTROL account. Joins the brewery
+      #                                   MUC so Jicofo can discover the bridge.
+      #                                   This is what makes Jicofo's
+      #                                   `jigasi_detector.transcriber_count`
+      #                                   report 1.
+      #   transcriber@hidden.meet.jitsi — the CONFERENCE account. The identity
+      #                                   jigasi actually enters a meeting room
+      #                                   with, on the hidden domain so it never
+      #                                   appears in the participant list.
+      #
+      # Registering only the first produces a deployment that looks completely
+      # healthy — jigasi is up, the brewery join succeeds, `transcriber_count` is
+      # 1, and Ameen's own transcription state reaches "Processing" — while every
+      # actual transcription request dies with:
+      #
+      #   SASLError using SCRAM-SHA-1: not-authorized  (transcriber@hidden…)
+      #   → Fail to join muc!  → Jicofo: "Request failed, no instances available"
+      #
+      # Nothing upstream of that surfaces the cause, which is exactly how this
+      # went unnoticed. XMPP_HIDDEN_DOMAIN must be here too: without it Prosody
+      # never creates the virtual host the transcriber account lives on, so the
+      # account cannot be registered even with the credentials present.
       - JIGASI_XMPP_USER=${JIGASI_XMPP_USER:-jigasi}
       - JIGASI_XMPP_PASSWORD=${JIGASI_XMPP_PASSWORD}
+      - JIGASI_TRANSCRIBER_USER=${JIGASI_TRANSCRIBER_USER:-transcriber}
+      - JIGASI_TRANSCRIBER_PASSWORD=${JIGASI_TRANSCRIBER_PASSWORD}
+      - XMPP_HIDDEN_DOMAIN=${XMPP_HIDDEN_DOMAIN:-hidden.meet.jitsi}
     networks:
       jitsi:
         aliases:
@@ -418,8 +446,25 @@ services:
     # backend needs a narrowly-scoped published port for it — is a decision
     # `deployment/compose.ubuntu.yml`'s "no ports: block" comment deliberately
     # left unmade; see README §"Live transcription" before deploying this profile.
+    #
+    # WHY THIS IS OVERRIDABLE, and why the default is not always right:
+    # on Docker Desktop for Mac, `host-gateway` resolves `host.docker.internal`
+    # to an IPv6 ULA (fdc4:…::254) that is NOT routable to a host process
+    # listening on IPv4. `curl` hides this because it falls back to IPv4 —
+    # Jetty's WebSocket client, which is what jigasi actually uses to reach the
+    # ingest endpoint, does not. It takes the first resolved address, fails to
+    # connect, and leaves its session null. The visible symptom is a transcript
+    # that never fills while every health check passes, and jigasi logging only
+    #   NullPointerException: "this.session" is null
+    # at teardown — with nothing anywhere naming the address family as the cause.
+    #
+    # Set HOST_GATEWAY_IP to an IPv4 address the container can actually reach
+    # (on Docker Desktop for Mac that is 192.168.65.254; verify with
+    # `docker compose exec jigasi curl -sS -o /dev/null -w '%{http_code}' \
+    #   http://<ip>:3001/health`). Leave it unset on Linux, where `host-gateway`
+    # is correct and resolves to the IPv4 bridge gateway.
     extra_hosts:
-      - 'host.docker.internal:host-gateway'
+      - 'host.docker.internal:${HOST_GATEWAY_IP:-host-gateway}'
     networks:
       - jitsi
     depends_on:

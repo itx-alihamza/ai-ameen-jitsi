@@ -29,6 +29,26 @@ echo
 echo "Live transcription chain"
 echo
 
+# ── 0. The media address JVB advertises ──────────────────────────────────────
+# Checked FIRST because when it is wrong, everything downstream still looks
+# perfectly healthy: jigasi runs, registers, is invited, and joins the room —
+# then receives no audio at all, because ICE cannot complete for ANY
+# participant. The symptom is a transcript stuck on "Processing" forever, and
+# the cause is invisible unless you happen to compare two numbers.
+#
+# This bites on any laptop that moves between networks, since DOCKER_HOST_ADDRESS
+# is a fixed value in .env while the machine's LAN address is not.
+HOST_IP="$(ifconfig 2>/dev/null | grep -E '^[[:space:]]*inet ' | grep -v 127.0.0.1 | awk '{print $2}' | head -1)"
+ADVERTISED="$(grep -E '^DOCKER_HOST_ADDRESS=' .env | tail -1 | cut -d= -f2- | tr -d '"'\''[:space:]')"
+if [[ -z "$HOST_IP" ]]; then
+  ok "skipping media-address check (no LAN address detected)"
+elif [[ "$ADVERTISED" == "$HOST_IP" ]]; then
+  ok "JVB advertises this machine's current LAN address (${HOST_IP})"
+else
+  bad "JVB advertises ${ADVERTISED:-<unset>}, but this machine is ${HOST_IP}" \
+      "Media cannot reach the bridge, so jigasi receives no audio and the transcript never fills. Set DOCKER_HOST_ADDRESS=${HOST_IP} and JVB_ADVERTISE_IPS=172.20.0.3,${HOST_IP} in .env, then: docker compose up -d --force-recreate jvb"
+fi
+
 # ── 1. jigasi running ────────────────────────────────────────────────────────
 STATE="$(docker compose --profile transcription ps -a --format '{{.Service}} {{.State}}' 2>/dev/null | awk '$1=="jigasi"{print $2}')"
 if [[ "$STATE" == "running" ]]; then
@@ -73,6 +93,28 @@ fi
 # Reached from the host, so host.docker.internal is rewritten to localhost. This
 # checks the backend answers and that the token is accepted — a bad token is
 # refused at the HTTP upgrade with a bare 401 and no detail, by design.
+# ── 5a. Reachability FROM INSIDE the container ───────────────────────────────
+# Checked from jigasi's own network namespace, not from the host, because those
+# are different paths and only this one is real. Testing from the host by
+# rewriting host.docker.internal → 127.0.0.1 (which this script used to do)
+# passes on a deployment where jigasi cannot reach the backend at all: on Docker
+# Desktop for Mac `host-gateway` resolves to an IPv6 address with no IPv4-listening
+# process behind it, and jigasi's Jetty client — unlike curl — does not fall back.
+if [[ -n "$INGEST_URL" ]]; then
+  INGEST_HOST="$(sed -E 's|^wss?://([^:/]+).*|\1|' <<<"$INGEST_URL")"
+  INGEST_PORT="$(sed -E 's|^wss?://[^:/]+:([0-9]+).*|\1|' <<<"$INGEST_URL")"
+  CODE="$(docker compose exec -T jigasi sh -c \
+    "timeout 6 curl -sS -o /dev/null -w '%{http_code}' http://${INGEST_HOST}:${INGEST_PORT:-3001}/health 2>/dev/null" 2>/dev/null | tr -dc '0-9')"
+  if [[ "$CODE" == "200" ]]; then
+    ok "jigasi can reach the backend at ${INGEST_HOST} (from inside the container)"
+  else
+    RESOLVED="$(docker compose exec -T jigasi sh -c "getent hosts ${INGEST_HOST}" 2>/dev/null | awk '{print $1}' | head -1)"
+    bad "jigasi cannot reach the backend at ${INGEST_HOST} (HTTP ${CODE:-000}); it resolves to ${RESOLVED:-nothing}" \
+        "If that is an IPv6 address, set HOST_GATEWAY_IP in .env to an IPv4 the container can reach (Docker Desktop for Mac: 192.168.65.254), then: docker compose --profile transcription up -d --force-recreate jigasi"
+  fi
+fi
+
+# ── 6. Token accepted, and the stream not immediately refused ────────────────
 if [[ -n "$INGEST_URL" ]]; then
   HOST_URL="${INGEST_URL/host.docker.internal/127.0.0.1}"
   # `ws` is a backend dependency, not a dependency of this directory (which has no
